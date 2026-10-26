@@ -49,12 +49,25 @@ export function buildTranscript(
     .join("\n\n");
 }
 
-/** Example titles, shown to the model so it sees the exact answer format. */
+/**
+ * Example titles, shown to the model so it sees the exact answer format. The
+ * prompt shows the first three that fit the length limit, so that no example
+ * breaks the rule that it is shown with.
+ */
 const EXAMPLES = [
   ["🐛", "Fix flaky login test"],
   ["🧭", "Add back and forward thread navigation"],
   ["📦", "Publish the retitle plugin"],
+  ["🔍", "Debug CI cache"],
+  ["🔧", "Fix CI"],
+  ["✏️", "Fix typo"],
 ] as const;
+const EXAMPLES_SHOWN = 3;
+
+/** Number of user-perceived characters, so an emoji sequence counts as one. */
+export function countCharacters(text: string): number {
+  return Array.from(new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(text)).length;
+}
 
 export function buildPrompt(args: {
   transcript: string;
@@ -66,7 +79,10 @@ export function buildPrompt(args: {
   // small model sometimes answered the instructions ("I understand…") and
   // ignored the conversation. The examples show the exact answer format. The
   // title rules copy bb's own title prompt, so these titles look like bb's.
-  const examples = EXAMPLES.map(([emoji, text]) => (args.emoji ? `${emoji} ${text}` : text));
+  const maxTitleLength = args.maxTitleLength ?? MAX_TITLE_CHARS;
+  const examples = EXAMPLES.map(([emoji, text]) => (args.emoji ? `${emoji} ${text}` : text))
+    .filter((example) => countCharacters(example) <= maxTitleLength)
+    .slice(0, EXAMPLES_SHOWN);
   return [
     "Here is a conversation between a user and a coding agent.",
     "",
@@ -78,8 +94,8 @@ export function buildPrompt(args: {
     "",
     "Rules:",
     "- Sentence case, in the same language as the conversation.",
-    (args.maxTitleLength ?? MAX_TITLE_CHARS) < PROMPT_LENGTH_HINT
-      ? `- At most ${args.maxTitleLength} characters, including any emoji and spaces.`
+    maxTitleLength < PROMPT_LENGTH_HINT
+      ? `- At most ${maxTitleLength} characters, including any emoji and spaces.`
       : "- Under about 40 characters; for scripts that do not separate words with spaces, that is roughly 20 characters.",
     args.emoji
       ? "- Start with one emoji that fits the topic, then a space. Use no other emoji."

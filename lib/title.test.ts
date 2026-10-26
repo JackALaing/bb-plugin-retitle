@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   MAX_TITLE_CHARS,
+  MIN_TITLE_CHARS,
   buildPrompt,
   buildTranscript,
   cleanTitle,
@@ -142,6 +143,25 @@ describe("buildPrompt length rule", () => {
     const prompt = buildPrompt({ ...base, maxTitleLength: 24 });
     expect(prompt).toContain("At most 24 characters, including any emoji and spaces.");
     expect(prompt).not.toContain("Under about 40 characters");
+  });
+});
+
+describe("buildPrompt examples", () => {
+  const graphemes = (text: string) =>
+    Array.from(new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(text)).length;
+  const examplesIn = (prompt: string) =>
+    prompt.split("Example titles:\n")[1]!.split("\n\n")[0]!.split("\n");
+
+  it.each([true, false])("shows only examples that fit the limit (emoji: %s)", (emoji) => {
+    for (let max = MIN_TITLE_CHARS; max <= MAX_TITLE_CHARS; max++) {
+      const examples = examplesIn(
+        buildPrompt({ transcript: "User: hi", currentTitle: null, emoji, maxTitleLength: max }),
+      );
+      expect(examples.length, `limit ${max}`).toBeGreaterThan(0);
+      for (const example of examples) {
+        expect(graphemes(example), `${JSON.stringify(example)} at limit ${max}`).toBeLessThanOrEqual(max);
+      }
+    }
   });
 });
 
