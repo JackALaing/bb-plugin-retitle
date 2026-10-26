@@ -8,6 +8,7 @@ import {
   parseReasoningLevel,
   pickReasoningLevel,
   pickSmallModel,
+  RETRY_AFTER_MESSAGES,
   type ThreadFacts,
 } from "./policy";
 
@@ -110,6 +111,60 @@ describe("decideAutoRename", () => {
   });
 });
 
+describe("decideAutoRename after a failed rename", () => {
+  const failure = { messageCount: 4, title: "What git rebase does", maxTitleLength: 30 };
+  const afterFailure = (overrides: Partial<Parameters<typeof decideAutoRename>[0]> = {}) =>
+    decide({ failure, maxTitleLength: 30, ...overrides });
+
+  it("waits renameEveryMessages new messages after the failure, then renames", () => {
+    const record = { title: "What git rebase does", messageCount: 2 };
+    expect(afterFailure({ renameEveryMessages: 6, record, messageCount: 9 })).toEqual({
+      rename: false,
+      reason: "not enough new messages since the last failed rename",
+    });
+    expect(afterFailure({ renameEveryMessages: 6, record, messageCount: 10 })).toEqual({ rename: true });
+  });
+
+  it("does not stop the first rename forever when renameEveryMessages is 0", () => {
+    expect(afterFailure({ messageCount: 4 + RETRY_AFTER_MESSAGES - 1 })).toMatchObject({ rename: false });
+    expect(afterFailure({ messageCount: 4 + RETRY_AFTER_MESSAGES })).toEqual({ rename: true });
+  });
+
+  it("does not wait without a failure, as before", () => {
+    expect(decide({ messageCount: 4, failure: null })).toEqual({ rename: true });
+    expect(decide({ messageCount: null })).toEqual({ rename: true });
+  });
+
+  it("stops when the title changed, even with no earlier rename", () => {
+    expect(afterFailure({ thread: thread({ title: "Typed by the user" }), messageCount: 40 })).toEqual({
+      rename: false,
+      reason: "the title changed after a failed rename",
+    });
+    expect(afterFailure({ thread: thread({ title: null }), messageCount: 40 })).toMatchObject({ rename: false });
+  });
+
+  it("stops when the title changed, at any limit", () => {
+    expect(
+      afterFailure({ thread: thread({ title: "Typed by the user" }), messageCount: 40, maxTitleLength: 80 }),
+    ).toMatchObject({ rename: false });
+  });
+
+  it("does not make a title typed by the user the plugin's own", () => {
+    const record = { title: "What git rebase does", messageCount: 2 };
+    expect(
+      afterFailure({ thread: thread({ title: "Typed by the user" }), renameEveryMessages: 6, record, messageCount: 40 }),
+    ).toEqual({ rename: false, reason: "the user changed the title" });
+  });
+
+  it.each([40, 80, 25])("does not wait for a failure at another limit (now %i)", (maxTitleLength) => {
+    expect(afterFailure({ messageCount: 5, maxTitleLength })).toEqual({ rename: true });
+  });
+
+  it("does not rename when it cannot count the messages", () => {
+    expect(afterFailure({ messageCount: null })).toEqual({ rename: false, reason: "message count unknown" });
+  });
+});
+
 describe("needsMessageCount", () => {
   const record = { title: "t", messageCount: 2 };
 
@@ -120,6 +175,15 @@ describe("needsMessageCount", () => {
       false,
     );
     expect(needsMessageCount({ mode: "off", renameEveryMessages: 6, record })).toBe(false);
+  });
+
+  it("is true after a failed rename, even before the first rename", () => {
+    expect(
+      needsMessageCount({ mode: "first-reply", renameEveryMessages: 0, record: null, failure: { messageCount: 3, title: null, maxTitleLength: 30 } }),
+    ).toBe(true);
+    expect(
+      needsMessageCount({ mode: "off", renameEveryMessages: 0, record: null, failure: { messageCount: 3, title: null, maxTitleLength: 30 } }),
+    ).toBe(false);
   });
 });
 

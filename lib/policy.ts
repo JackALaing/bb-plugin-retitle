@@ -20,6 +20,29 @@ export interface TitleRecord {
   messageCount: number;
 }
 
+/**
+ * A short-limit rename whose helper answer had no usable candidate. It is
+ * kept apart from TitleRecord, so it never marks a title as written by the
+ * plugin.
+ */
+export interface FailedAttempt {
+  /** Number of outline messages at the failed rename. */
+  messageCount: number;
+  /**
+   * The thread title when the first failed rename started. A later title that
+   * differs was changed by someone, so automatic renaming stops.
+   */
+  title: string | null;
+  /** The `maxTitleLength` of the failed rename. */
+  maxTitleLength: number;
+}
+
+/**
+ * New messages to wait for after a failed rename when `renameEveryMessages`
+ * is 0. Otherwise the plugin waits `renameEveryMessages`.
+ */
+export const RETRY_AFTER_MESSAGES = 10;
+
 /** The thread facts that the rules use. */
 export interface ThreadFacts {
   title: string | null;
@@ -45,6 +68,37 @@ export type Decision = { rename: true } | { rename: false; reason: string };
  * pass null when `needsMessageCount` is false, to save a server call.
  */
 export function decideAutoRename(args: {
+  thread: ThreadFacts;
+  pluginId: string;
+  mode: AutoMode;
+  renameEveryMessages: number;
+  record: TitleRecord | null;
+  messageCount: number | null;
+  /**
+   * The last failed rename, or null. After a failure, a changed title stops
+   * automatic renaming. With the same `maxTitleLength`, the plugin also waits
+   * for new messages before it tries again.
+   */
+  failure?: FailedAttempt | null;
+  /** The current `maxTitleLength`. Needed only with a failure. */
+  maxTitleLength?: number;
+}): Decision {
+  const decision = decideFromRecord(args);
+  if (!decision.rename || !args.failure) return decision;
+  if ((args.thread.title ?? null) !== args.failure.title) {
+    return { rename: false, reason: "the title changed after a failed rename" };
+  }
+  // A failure at another limit says nothing about this one.
+  if (args.failure.maxTitleLength !== args.maxTitleLength) return decision;
+  if (args.messageCount === null) return { rename: false, reason: "message count unknown" };
+  const wait = args.renameEveryMessages > 0 ? args.renameEveryMessages : RETRY_AFTER_MESSAGES;
+  if (args.messageCount - args.failure.messageCount < wait) {
+    return { rename: false, reason: "not enough new messages since the last failed rename" };
+  }
+  return decision;
+}
+
+function decideFromRecord(args: {
   thread: ThreadFacts;
   pluginId: string;
   mode: AutoMode;
@@ -83,8 +137,10 @@ export function needsMessageCount(args: {
   mode: AutoMode;
   renameEveryMessages: number;
   record: TitleRecord | null;
+  failure?: FailedAttempt | null;
 }): boolean {
-  return args.mode !== "off" && args.record !== null && args.renameEveryMessages > 0;
+  if (args.mode === "off") return false;
+  return (args.record !== null && args.renameEveryMessages > 0) || Boolean(args.failure);
 }
 
 /**

@@ -26,16 +26,20 @@ import {
   pickReasoningLevel,
   pickSmallModel,
   REASONING_LEVELS,
+  type FailedAttempt,
   type ThreadFacts,
   type TitleRecord,
 } from "./lib/policy";
 import {
+  buildCandidatePrompt,
   buildPrompt,
   buildTranscript,
   cleanTitle,
   MAX_TITLE_CHARS,
   MIN_TITLE_CHARS,
+  pickCandidate,
   resolveMaxTitleLength,
+  usesCandidates,
 } from "./lib/title";
 
 export const rpcContract = defineRpcContract({
@@ -117,6 +121,7 @@ export default async function plugin(bb: BbPluginApi) {
   });
 
   const recordKey = (threadId: string) => `title:${threadId}`;
+  const failureKey = (threadId: string) => `failed:${threadId}`;
 
   /**
    * Select the provider, model and reasoning level for the helper. The
@@ -264,31 +269,59 @@ export default async function plugin(bb: BbPluginApi) {
     const environmentId = thread.environmentId ?? null;
     const execution = await resolveHelperExecution({ providerId: thread.providerId, environmentId });
     const maxTitleLength = resolveMaxTitleLength(config.maxTitleLength);
-    const prompt = buildPrompt({
-      transcript,
-      currentTitle: thread.title ?? null,
-      emoji: config.emoji,
-      maxTitleLength,
+    const previousTitle = thread.title ?? null;
+    const candidates = usesCandidates(maxTitleLength);
+    const promptArgs = { transcript, currentTitle: previousTitle, emoji: config.emoji, maxTitleLength };
+    const answer = await askHelper({
+      projectId: thread.projectId,
+      environmentId,
+      execution,
+      targetThreadId: threadId,
+      targetArchived: thread.archivedAt !== null,
+      prompt: candidates ? buildCandidatePrompt(promptArgs) : buildPrompt(promptArgs),
     });
 
-    const title = cleanTitle(
-      await askHelper({
-        projectId: thread.projectId,
-        environmentId,
-        execution,
-        targetThreadId: threadId,
-        targetArchived: thread.archivedAt !== null,
-        prompt,
-      }),
-      maxTitleLength,
-    );
-    if (title === null) throw new Error("The helper model returned an empty title.");
+    let title: string | null;
+    if (candidates) {
+      const pick = pickCandidate(answer, maxTitleLength);
+      title = pick.title;
+      if (title === null) {
+        bb.log.info(
+          `no usable candidate for ${threadId}: ${pick.problem} ${JSON.stringify(pick.candidates)}`,
+        );
+        // Automatic renaming waits for new messages before it tries again,
+        // and stops if the title changes. The title to compare is the one from
+        // the start of the first failed rename, never a later one.
+        const earlier = await bb.storage.kv.get<FailedAttempt>(failureKey(threadId));
+        const failure: FailedAttempt = {
+          messageCount: outline.items.length,
+          title: earlier ? earlier.title : previousTitle,
+          maxTitleLength,
+        };
+        await bb.storage.kv.set(failureKey(threadId), failure);
+        throw new Error(
+          `The helper answer had no usable title within ${maxTitleLength} characters (${pick.problem}), so the thread keeps its title.`,
+        );
+      }
+    } else {
+      title = cleanTitle(answer, maxTitleLength);
+      if (title === null) throw new Error("The helper model returned an empty title.");
+    }
 
+    // The helper takes some seconds. Do not replace a title that changed
+    // meanwhile, for example one that the user typed. bb has no conditional
+    // update, so a change in the moment between this read and the write is
+    // still replaced.
+    const current = await bb.sdk.threads.get({ threadId });
+    if ((current.title ?? null) !== previousTitle) {
+      throw new Error("The title changed during the rename, so Retitle kept it.");
+    }
     await bb.sdk.threads.update({ threadId, title });
     const record: TitleRecord = { title, messageCount: outline.items.length };
     await bb.storage.kv.set(recordKey(threadId), record);
+    await bb.storage.kv.delete(failureKey(threadId));
     bb.log.info(`retitled ${threadId}: ${title}`);
-    return { title, previousTitle: thread.title ?? null };
+    return { title, previousTitle };
   }
 
   /** One rename at a time for each thread. A second request joins the first. */
@@ -306,7 +339,8 @@ export default async function plugin(bb: BbPluginApi) {
     const mode = parseAutoMode(config.autoRename);
     const renameEveryMessages = config.renameEveryMessages;
     const record = (await bb.storage.kv.get<TitleRecord>(recordKey(thread.id))) ?? null;
-    const messageCount = needsMessageCount({ mode, renameEveryMessages, record })
+    const failure = (await bb.storage.kv.get<FailedAttempt>(failureKey(thread.id))) ?? null;
+    const messageCount = needsMessageCount({ mode, renameEveryMessages, record, failure })
       ? (await bb.sdk.threads.conversationOutline({ threadId: thread.id })).items.length
       : null;
     const decision = decideAutoRename({
@@ -316,6 +350,8 @@ export default async function plugin(bb: BbPluginApi) {
       renameEveryMessages,
       record,
       messageCount,
+      failure,
+      maxTitleLength: resolveMaxTitleLength(config.maxTitleLength),
     });
     if (decision.rename) await retitleOnce(thread.id);
   }
@@ -327,6 +363,7 @@ export default async function plugin(bb: BbPluginApi) {
   });
   bb.events.on("thread.deleted", ({ thread }) => {
     void bb.storage.kv.delete(recordKey(thread.id)).catch(() => {});
+    void bb.storage.kv.delete(failureKey(thread.id)).catch(() => {});
   });
 
   bb.rpc.register(rpcContract, {

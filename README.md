@@ -58,7 +58,7 @@ Change the settings in Settings → Installed plugins → Retitle, or with
 | `providerId` | empty | Provider for the helper. Empty means the provider of the thread. |
 | `model` | empty | Model for the helper. Empty means a small model from the table above. |
 | `reasoningLevel` | low | Reasoning level for the helper: low, medium or high. If the plugin selects a helper model and the provider's model list shows that the model does not support the level, the model's default level is used. Otherwise, including when bb chooses the model or the model list cannot be loaded, the setting is sent as is. |
-| `maxTitleLength` | 80 | Longest title in characters, counting the emoji and spaces. Values from 10 to 80; others are clamped. Below 40, the prompt asks for this exact limit. |
+| `maxTitleLength` | 80 | Longest title in characters, counting the emoji and spaces. Values from 10 to 80; others are clamped. Below 40, the helper writes three candidate titles and the plugin uses the first usable one; see How it works. At 40 or more, a longer answer is cut. |
 | `timeoutSeconds` | 90 | Time to wait for the helper before the rename fails. |
 
 ## How it works
@@ -70,7 +70,28 @@ A plugin cannot call bb's own title model. So for each rename the plugin:
    newest messages, up to 12,000 characters.
 2. Starts a hidden helper thread in the same environment as the renamed thread.
    bb does not make a new worktree.
-3. Waits for the answer, sets the title, and deletes the helper thread.
+3. Waits for the answer and deletes the helper thread.
+4. Sets the title, unless the title changed while the helper ran. A title that
+   you type during a rename stays. bb has no conditional update, so a change in
+   the last moment before the write can still be replaced.
+
+When `maxTitleLength` is under 40, the helper writes three candidate titles in
+one answer, one per line, each shorter than the one before. The answer must
+have exactly three lines that are not empty and no code fence line (```` ``` ````
+or `~~~`); any other answer is not used.
+The plugin removes numbering, bullets, markdown, quotes, and one trailing
+period, then takes the first line that fits the limit and does not end with
+an ellipsis. Nothing is cut. These checks are on the format only: they do not
+show that a title is good or complete.
+
+If no line is usable, the thread keeps its title and the rename stops with an
+error. Automatic renaming then waits for new messages before it tries again:
+`renameEveryMessages` messages, or 10 when that setting is 0. If the title
+changes after the failed rename, automatic renaming stops for that thread,
+also when the plugin had not renamed it before. After a change of
+`maxTitleLength`, the wait does not apply, but a changed title still stops
+automatic renaming. ⌘⌥R and `bb retitle` still work at once, and a successful
+rename clears the failure.
 
 A rename takes about 15 seconds, because the provider must start an agent
 session. If the helper cannot start or fails, the rename stops with an error

@@ -26,6 +26,8 @@ function createHost(
     messages?: Message[];
     answer?: string;
     helperStatus?: "idle" | "error";
+    /** Runs when the plugin reads the helper's answer, as if the user acted meanwhile. */
+    onOutput?: (state: { title: string | null }) => void;
     spawnError?: string;
     models?: (string | CatalogModel)[];
     modelsError?: string;
@@ -35,6 +37,7 @@ function createHost(
 ) {
   const state = {
     title: options.title === undefined ? "What git rebase does" : options.title,
+    answer: options.answer ?? '"🔄 Git rebase explained."',
     messages: options.messages ?? [
       { role: "user", preview: "In two sentences: what does git rebase do?" },
       { role: "assistant", preview: "It moves your commits onto a new base." },
@@ -111,7 +114,10 @@ function createHost(
           spawns.push(args as Record<string, unknown>);
           return makeThreadResponse({ id: HELPER_ID, visibility: "hidden" });
         },
-        output: async () => ({ output: options.answer ?? '"🔄 Git rebase explained."' }),
+        output: async () => {
+          options.onOutput?.(state);
+          return { output: state.answer };
+        },
         update: async (args: { threadId: string; title?: string | null }) => {
           updates.push(args);
           if (args.title !== undefined) state.title = args.title;
@@ -388,24 +394,207 @@ describe("helper reasoning", () => {
 describe("maximum title length", () => {
   const graphemes = (text: string) =>
     Array.from(new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(text));
+  const more = (host: ReturnType<typeof createHost>, count: number) =>
+    host.state.messages.push(...Array.from({ length: count }, () => ({ role: "user" as const, preview: "more" })));
+  const failed = (host: ReturnType<typeof createHost>) => host.bb.storage.kv.get(`failed:${THREAD_ID}`);
+  const TOO_LONG = `${"a".repeat(31)}\n${"b".repeat(31)}\n${"c".repeat(31)}`;
+  const ORIGINAL = { messageCount: 2, title: "What git rebase does", maxTitleLength: 30 };
+  const tick = async (host: ReturnType<typeof createHost>) => {
+    await idle(host);
+    await settle();
+  };
 
-  it("asks for the limit and cuts a longer answer to it", async () => {
+  it("below 40, asks one helper for three candidates and writes the first that fits", async () => {
     const host = await load(
-      createHost({ settings: { maxTitleLength: 30 }, answer: `🧑🏽‍💻 ${"a".repeat(60)}` }),
+      createHost({
+        settings: { maxTitleLength: 30 },
+        answer: "Editor plugin PR reviews and merges\nEditor plugin PRs\nPlugins",
+      }),
+    );
+    const result = await host.harness.behavior.callRpc("retitle", { threadId: THREAD_ID });
+
+    expect(host.spawns).toHaveLength(1);
+    expect(host.spawns[0]?.prompt).toContain("write three candidate titles");
+    expect(host.spawns[0]?.prompt).toContain("At most 30 characters each");
+    expect(result).toEqual({ title: "Editor plugin PRs", previousTitle: "What git rebase does" });
+    expect(await host.bb.storage.kv.get(`title:${THREAD_ID}`)).toEqual({ title: "Editor plugin PRs", messageCount: 2 });
+    expect(host.deleted).toEqual([HELPER_ID]);
+  });
+
+  it.each([
+    ["only titles that are too long", TOO_LONG, "no line fits"],
+    ["an empty answer", "  \n", "0 lines, not 3"],
+    ["one cut-off title", "Maintain editor plugin PRs an…", "1 lines, not 3"],
+    ["a lead-in before three titles", "Here are three titles:\nKyoto trip in April\nKyoto trip\nKyoto", "4 lines, not 3"],
+    ["titles that end with an ellipsis", "Kyoto trip..\nKyoto trip...\nKyoto…", "no line fits"],
+    ["one fenced title", "~~~\nKyoto trip\n~~~", "code fence"],
+  ])("keeps the title, and asks no second helper, for %s", async (_name, answer, problem) => {
+    const host = await load(createHost({ settings: { maxTitleLength: 30 }, answer }));
+
+    await expect(host.harness.behavior.callRpc("retitle", { threadId: THREAD_ID })).rejects.toThrow(
+      `no usable title within 30 characters (${problem}), so the thread keeps its title`,
+    );
+    expect(host.spawns).toHaveLength(1);
+    expect(host.updates).toEqual([]);
+    expect(host.state.title).toBe("What git rebase does");
+    expect(host.deleted).toEqual([HELPER_ID]);
+    expect(await host.bb.storage.kv.get(`title:${THREAD_ID}`)).toBeUndefined();
+    expect(await failed(host)).toEqual(ORIGINAL);
+  });
+
+  it("after a failed automatic rename, waits for new messages instead of trying at each idle", async () => {
+    const host = await load(createHost({ settings: { maxTitleLength: 30 }, answer: TOO_LONG }));
+    await tick(host);
+    expect(host.spawns).toHaveLength(1);
+
+    await tick(host);
+    more(host, 9);
+    await tick(host);
+    expect(host.spawns).toHaveLength(1);
+
+    // renameEveryMessages is 0, so it waits RETRY_AFTER_MESSAGES (10), not forever.
+    more(host, 1);
+    host.state.answer = "Kyoto trip in April\nKyoto trip\nKyoto";
+    await tick(host);
+    expect(host.spawns).toHaveLength(2);
+    expect(host.updates).toEqual([{ threadId: THREAD_ID, title: "Kyoto trip in April" }]);
+    expect(await failed(host)).toBeUndefined();
+  });
+
+  it("keeps the title of the first failure when a later one fails", async () => {
+    const host = await load(createHost({ settings: { maxTitleLength: 30 }, answer: TOO_LONG }));
+    await tick(host);
+    more(host, 10);
+    await tick(host);
+    expect(host.spawns).toHaveLength(2);
+    expect(await failed(host)).toEqual({ ...ORIGINAL, messageCount: 12 });
+  });
+
+  it("after a failed periodic rename, waits renameEveryMessages, and keeps the record", async () => {
+    const host = await load(
+      createHost({ settings: { maxTitleLength: 30, renameEveryMessages: 6 }, answer: "Kyoto trip plan\nKyoto trip\nKyoto" }),
+    );
+    await tick(host);
+    host.state.answer = TOO_LONG;
+    more(host, 6);
+    await tick(host);
+    expect(host.spawns).toHaveLength(2);
+    expect(await host.bb.storage.kv.get(`title:${THREAD_ID}`)).toEqual({ title: "Kyoto trip plan", messageCount: 2 });
+    expect(await failed(host)).toEqual({ messageCount: 8, title: "Kyoto trip plan", maxTitleLength: 30 });
+
+    more(host, 5);
+    await tick(host);
+    expect(host.spawns).toHaveLength(2);
+    more(host, 1);
+    await tick(host);
+    expect(host.spawns).toHaveLength(3);
+  });
+
+  it("after a failed first rename, does not replace a title typed later", async () => {
+    const host = await load(createHost({ settings: { maxTitleLength: 30 }, answer: TOO_LONG }));
+    await tick(host);
+    host.state.title = "Typed by the user";
+    host.state.answer = "Kyoto trip in April\nKyoto trip\nKyoto";
+    more(host, 30);
+    await tick(host);
+    expect(host.spawns).toHaveLength(1);
+    expect(host.state.title).toBe("Typed by the user");
+    expect(await failed(host)).toEqual(ORIGINAL);
+  });
+
+  it("after a failed first rename, does not replace a title typed while the helper ran", async () => {
+    const host = await load(
+      createHost({
+        settings: { maxTitleLength: 30 },
+        answer: TOO_LONG,
+        onOutput: (state) => {
+          state.title = "Typed by the user";
+        },
+      }),
+    );
+    await tick(host);
+    expect(await failed(host)).toEqual(ORIGINAL);
+
+    host.state.answer = "Kyoto trip in April\nKyoto trip\nKyoto";
+    more(host, 30);
+    await tick(host);
+    expect(host.spawns).toHaveLength(1);
+    expect(host.state.title).toBe("Typed by the user");
+  });
+
+  it("still renames at once on demand after a failure, even after a typed title", async () => {
+    const host = await load(createHost({ settings: { maxTitleLength: 30 }, answer: TOO_LONG }));
+    await expect(host.harness.behavior.callRpc("retitle", { threadId: THREAD_ID })).rejects.toThrow();
+    host.state.title = "Typed by the user";
+    host.state.answer = "Kyoto trip in April\nKyoto trip\nKyoto";
+    await expect(host.harness.behavior.callRpc("retitle", { threadId: THREAD_ID })).resolves.toMatchObject({
+      title: "Kyoto trip in April",
+    });
+    expect(await failed(host)).toBeUndefined();
+  });
+
+  it.each([40, 80, 25])("does not wait for a failure at limit 30 after a change to %i", async (maxTitleLength) => {
+    const host = await load(createHost({ settings: { maxTitleLength }, answer: "Kyoto trip in April\nKyoto trip\nKyoto" }));
+    await host.bb.storage.kv.set(`failed:${THREAD_ID}`, { ...ORIGINAL, messageCount: 2 });
+    await tick(host);
+    expect(host.spawns).toHaveLength(1);
+    expect(host.updates).toHaveLength(1);
+    expect(await failed(host)).toBeUndefined();
+  });
+
+  it("does not record a failure when the helper itself fails", async () => {
+    const host = await load(createHost({ settings: { maxTitleLength: 30 }, helperStatus: "error" }));
+    await expect(host.harness.behavior.callRpc("retitle", { threadId: THREAD_ID })).rejects.toThrow();
+    expect(await failed(host)).toBeUndefined();
+  });
+
+  it("at 40, keeps the single-title prompt and the cut", async () => {
+    const host = await load(
+      createHost({ settings: { maxTitleLength: 40 }, answer: `🧑🏽‍💻 ${"b".repeat(60)}` }),
     );
     await host.harness.behavior.callRpc("retitle", { threadId: THREAD_ID });
-    expect(host.spawns[0]?.prompt).toContain("At most 30 characters");
+    expect(host.spawns).toHaveLength(1);
+    expect(host.spawns[0]?.prompt).toContain("Under about 40 characters");
+    expect(host.spawns[0]?.prompt).not.toContain("candidate");
     const title = host.updates[0]?.title ?? "";
     expect(title.startsWith("🧑🏽‍💻 ")).toBe(true);
     expect(title.endsWith("…")).toBe(true);
-    expect(graphemes(title)).toHaveLength(30);
+    expect(graphemes(title)).toHaveLength(40);
+  });
+
+  it("at 40, keeps the single-title cleanup of periods", async () => {
+    const host = await load(createHost({ settings: { maxTitleLength: 40 }, answer: "Kyoto trip..\nsecond line" }));
+    await host.harness.behavior.callRpc("retitle", { threadId: THREAD_ID });
+    expect(host.updates[0]?.title).toBe("Kyoto trip.");
   });
 
   it("keeps the original prompt and 80-character cut by default", async () => {
     const host = await load(createHost({ answer: "b".repeat(120) }));
     await host.harness.behavior.callRpc("retitle", { threadId: THREAD_ID });
     expect(host.spawns[0]?.prompt).toContain("Under about 40 characters");
+    expect(host.spawns[0]?.prompt).not.toContain("candidate");
     expect(graphemes(host.updates[0]?.title ?? "")).toHaveLength(80);
+  });
+});
+
+describe("a title typed during the rename", () => {
+  it.each([30, 80])("is kept at limit %i", async (maxTitleLength) => {
+    const host = await load(
+      createHost({
+        settings: { maxTitleLength },
+        answer: "Kyoto trip plan\nKyoto trip\nKyoto",
+        onOutput: (state) => {
+          state.title = "Typed by the user";
+        },
+      }),
+    );
+
+    await expect(host.harness.behavior.callRpc("retitle", { threadId: THREAD_ID })).rejects.toThrow(
+      /title changed during the rename/,
+    );
+    expect(host.updates).toEqual([]);
+    expect(host.state.title).toBe("Typed by the user");
+    expect(host.deleted).toEqual([HELPER_ID]);
   });
 });
 
