@@ -57,6 +57,8 @@ Change the settings in Settings → Installed plugins → Retitle, or with
 | `emoji` | on | Starts each title with one emoji, for example "🐛 Fix flaky login test". |
 | `providerId` | empty | Provider for the helper. Empty means the provider of the thread. |
 | `model` | empty | Model for the helper. Empty means a small model from the table above. |
+| `reasoningLevel` | low | Reasoning level for the helper: low, medium or high. If the provider's model list shows that the helper model does not support it, the model's default level is used. |
+| `maxTitleLength` | 80 | Longest title in characters, counting the emoji and spaces. Values from 10 to 80; others are clamped. Below 40, the prompt asks for this exact limit. |
 | `timeoutSeconds` | 90 | Time to wait for the helper before the rename fails. |
 
 ## How it works

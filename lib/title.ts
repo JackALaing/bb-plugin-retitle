@@ -4,6 +4,15 @@
 /** Characters of conversation sent to the model. */
 export const MAX_TRANSCRIPT_CHARS = 12_000;
 export const MAX_TITLE_CHARS = 80;
+export const MIN_TITLE_CHARS = 10;
+/** Titles at or above this length keep the original, looser length rule. */
+const PROMPT_LENGTH_HINT = 40;
+
+/** Clamp the setting to a whole number of characters; anything unusable means the maximum. */
+export function resolveMaxTitleLength(value: unknown): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) return MAX_TITLE_CHARS;
+  return Math.min(MAX_TITLE_CHARS, Math.max(MIN_TITLE_CHARS, Math.floor(value)));
+}
 
 export interface OutlineItem {
   role: "user" | "assistant";
@@ -51,6 +60,7 @@ export function buildPrompt(args: {
   transcript: string;
   currentTitle: string | null;
   emoji: boolean;
+  maxTitleLength?: number;
 }): string {
   // The conversation comes first and the task last. With the task first, a
   // small model sometimes answered the instructions ("I understand…") and
@@ -68,7 +78,9 @@ export function buildPrompt(args: {
     "",
     "Rules:",
     "- Sentence case, in the same language as the conversation.",
-    "- Under about 40 characters; for scripts that do not separate words with spaces, that is roughly 20 characters.",
+    (args.maxTitleLength ?? MAX_TITLE_CHARS) < PROMPT_LENGTH_HINT
+      ? `- At most ${args.maxTitleLength} characters, including any emoji and spaces.`
+      : "- Under about 40 characters; for scripts that do not separate words with spaces, that is roughly 20 characters.",
     args.emoji
       ? "- Start with one emoji that fits the topic, then a space. Use no other emoji."
       : "- No emoji.",
@@ -87,8 +99,11 @@ export function buildPrompt(args: {
   ].join("\n");
 }
 
-/** Take the first line that is not empty, and remove quotes and markdown. */
-export function cleanTitle(raw: string): string | null {
+/**
+ * Take the first line that is not empty, and remove quotes and markdown.
+ * Length counts user-perceived characters, so a cut never splits an emoji.
+ */
+export function cleanTitle(raw: string, maxChars: number = MAX_TITLE_CHARS): string | null {
   const line = raw
     .split("\n")
     .map((part) => part.trim())
@@ -101,6 +116,11 @@ export function cleanTitle(raw: string): string | null {
     .replace(/\.$/, "")
     .trim();
   if (title === "") return null;
-  return title.length > MAX_TITLE_CHARS ? `${title.slice(0, MAX_TITLE_CHARS - 1)}…` : title;
+  const characters = Array.from(
+    new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(title),
+    (part) => part.segment,
+  );
+  if (characters.length <= maxChars) return title;
+  return `${characters.slice(0, maxChars - 1).join("").trimEnd()}…`;
 }
 

@@ -7,6 +7,12 @@ const THREAD_ID = "thr_target";
 const HELPER_ID = "thr_helper";
 
 type Message = { role: "user" | "assistant"; preview: string };
+type CatalogModel = {
+  model: string;
+  efforts?: string[];
+  defaultEffort?: string;
+  isDefault?: boolean;
+};
 
 /**
  * A fake bb host with one thread to rename. The helper thread answers with
@@ -21,7 +27,8 @@ function createHost(
     answer?: string;
     helperStatus?: "idle" | "error";
     spawnError?: string;
-    models?: string[];
+    models?: (string | CatalogModel)[];
+    modelsError?: string;
     settings?: Record<string, string | number | boolean>;
   } = {},
 ) {
@@ -51,12 +58,32 @@ function createHost(
     ...(options.settings ? { settings: options.settings } : {}),
     sdk: {
       providers: {
-        models: async () => ({
-          modelLoadError: null,
-          models: (options.models ?? ["claude-opus-5-5[1m]", "claude-haiku-4-5-20251001"]).map(
-            (model) => ({ id: model, model }),
-          ),
-        }),
+        models: async () => {
+          if (options.modelsError) throw new Error(options.modelsError);
+          return {
+            modelLoadError: null,
+            models: (options.models ?? ["claude-opus-5-5[1m]", "claude-haiku-4-5-20251001"]).map(
+              (entry) => {
+                const { model, efforts, defaultEffort, isDefault } =
+                  typeof entry === "string" ? { model: entry } : entry;
+                return {
+                  id: model,
+                  model,
+                  ...(isDefault !== undefined ? { isDefault } : {}),
+                  ...(defaultEffort !== undefined ? { defaultReasoningEffort: defaultEffort } : {}),
+                  ...(efforts
+                    ? {
+                        supportedReasoningEfforts: efforts.map((reasoningEffort) => ({
+                          reasoningEffort,
+                          description: "",
+                        })),
+                      }
+                    : {}),
+                };
+              },
+            ),
+          };
+        },
       },
       threads: {
         get: async ({ threadId }: { threadId: string }) =>
@@ -227,6 +254,117 @@ describe("renaming on demand", () => {
       host.harness.behavior.callRpc("retitle", { threadId: THREAD_ID }),
     ).rejects.toThrow(/no messages/);
     expect(host.spawns).toEqual([]);
+  });
+});
+
+describe("helper reasoning", () => {
+  it("uses the reasoning level from the settings when the model supports it", async () => {
+    const host = await load(
+      createHost({
+        models: [{ model: "claude-haiku-4-5-20251001", efforts: ["low", "medium", "high"] }],
+        settings: { reasoningLevel: "high" },
+      }),
+    );
+    await host.harness.behavior.callRpc("retitle", { threadId: THREAD_ID });
+    expect(host.spawns[0]).toMatchObject({
+      model: "claude-haiku-4-5-20251001",
+      reasoningLevel: "high",
+    });
+  });
+
+  it("uses the model's default level when the catalog does not list the setting", async () => {
+    const host = await load(
+      createHost({
+        models: [
+          {
+            model: "claude-haiku-4-5-20251001",
+            efforts: ["medium", "high"],
+            defaultEffort: "medium",
+          },
+        ],
+      }),
+    );
+    await host.harness.behavior.callRpc("retitle", { threadId: THREAD_ID });
+    expect(host.spawns[0]).toMatchObject({ reasoningLevel: "medium" });
+    expect(host.updates).toHaveLength(1);
+  });
+
+  it("leaves the level to bb when the catalog names no default", async () => {
+    const host = await load(
+      createHost({
+        models: [{ model: "claude-haiku-4-5-20251001", efforts: ["medium", "high"] }],
+      }),
+    );
+    await host.harness.behavior.callRpc("retitle", { threadId: THREAD_ID });
+    expect(host.spawns[0]).not.toHaveProperty("reasoningLevel");
+  });
+
+  it("checks the configured model, and the default model when none is chosen", async () => {
+    const configured = await load(
+      createHost({
+        models: [{ model: "gpt-5.4-mini", efforts: ["medium"] }],
+        settings: { providerId: "codex", model: "gpt-5.4-mini", reasoningLevel: "medium" },
+      }),
+    );
+    await configured.harness.behavior.callRpc("retitle", { threadId: THREAD_ID });
+    expect(configured.spawns[0]).toMatchObject({ model: "gpt-5.4-mini", reasoningLevel: "medium" });
+
+    const providerDefault = await load(
+      createHost({
+        models: [
+          { model: "big-model", efforts: ["high"], isDefault: true },
+          { model: "other-model", efforts: ["low"] },
+        ],
+      }),
+    );
+    await providerDefault.harness.behavior.callRpc("retitle", { threadId: THREAD_ID });
+    expect(providerDefault.spawns[0]).not.toHaveProperty("model");
+    expect(providerDefault.spawns[0]).not.toHaveProperty("reasoningLevel");
+  });
+
+  it("keeps the configured model and level when the catalog cannot be read", async () => {
+    const host = await load(
+      createHost({
+        modelsError: "catalog offline",
+        settings: { providerId: "codex", model: "gpt-5.4-mini", reasoningLevel: "medium" },
+      }),
+    );
+    await host.harness.behavior.callRpc("retitle", { threadId: THREAD_ID });
+    expect(host.spawns[0]).toMatchObject({
+      providerId: "codex",
+      model: "gpt-5.4-mini",
+      reasoningLevel: "medium",
+    });
+  });
+
+  it("falls back to low for a stored value that is not an option", async () => {
+    const host = await load(createHost({ settings: { reasoningLevel: "ultra" } }));
+    await host.harness.behavior.callRpc("retitle", { threadId: THREAD_ID });
+    expect(host.spawns[0]).toMatchObject({ reasoningLevel: "low" });
+  });
+});
+
+describe("maximum title length", () => {
+  const graphemes = (text: string) =>
+    Array.from(new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(text));
+
+  it("asks for the limit and cuts a longer answer to it", async () => {
+    const host = await load(
+      createHost({ settings: { maxTitleLength: 30 }, answer: `🧑🏽‍💻 ${"a".repeat(60)}` }),
+    );
+    await host.harness.behavior.callRpc("retitle", { threadId: THREAD_ID });
+    expect(host.spawns[0]?.prompt).toContain("At most 30 characters");
+    const title = host.updates[0]?.title ?? "";
+    expect(title.startsWith("🧑🏽‍💻 ")).toBe(true);
+    expect(title.endsWith("…")).toBe(true);
+    expect(graphemes(title)).toHaveLength(30);
+  });
+
+  it("keeps the original prompt and 80-character cut by default", async () => {
+    const host = await load(createHost({ answer: "b".repeat(120) }));
+    await host.harness.behavior.callRpc("retitle", { threadId: THREAD_ID });
+    expect(host.spawns[0]?.prompt).toContain("Under about 40 characters");
+    expect(graphemes(host.updates[0]?.title ?? "")).toHaveLength(80);
   });
 });
 
