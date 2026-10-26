@@ -29,6 +29,7 @@ function createHost(
     spawnError?: string;
     models?: (string | CatalogModel)[];
     modelsError?: string;
+    modelLoadError?: { providerId: string; code: "timeout" | "failed" };
     settings?: Record<string, string | number | boolean>;
   } = {},
 ) {
@@ -61,7 +62,7 @@ function createHost(
         models: async () => {
           if (options.modelsError) throw new Error(options.modelsError);
           return {
-            modelLoadError: null,
+            modelLoadError: options.modelLoadError ?? null,
             models: (options.models ?? ["claude-opus-5-5[1m]", "claude-haiku-4-5-20251001"]).map(
               (entry) => {
                 const { model, efforts, defaultEffort, isDefault } =
@@ -299,7 +300,7 @@ describe("helper reasoning", () => {
     expect(host.spawns[0]).not.toHaveProperty("reasoningLevel");
   });
 
-  it("checks the configured model, and the default model when none is chosen", async () => {
+  it("checks the configured model against the catalog", async () => {
     const configured = await load(
       createHost({
         models: [{ model: "gpt-5.4-mini", efforts: ["medium"] }],
@@ -308,18 +309,58 @@ describe("helper reasoning", () => {
     );
     await configured.harness.behavior.callRpc("retitle", { threadId: THREAD_ID });
     expect(configured.spawns[0]).toMatchObject({ model: "gpt-5.4-mini", reasoningLevel: "medium" });
+  });
 
-    const providerDefault = await load(
+  it("keeps the configured level when bb chooses the model", async () => {
+    // bb may run a remembered project model, so the catalog default's levels
+    // say nothing about the model that will run.
+    for (const models of [
+      [
+        { model: "big-model", efforts: ["high"], defaultEffort: "high", isDefault: true },
+        { model: "other-model", efforts: ["medium"] },
+      ],
+      [{ model: "big-model", efforts: ["high"], defaultEffort: "high" }],
+    ]) {
+      const host = await load(createHost({ models, settings: { reasoningLevel: "medium" } }));
+      await host.harness.behavior.callRpc("retitle", { threadId: THREAD_ID });
+      expect(host.spawns[0]).not.toHaveProperty("model");
+      expect(host.spawns[0]).toMatchObject({ reasoningLevel: "medium" });
+    }
+  });
+
+  it("keeps the configured level when the catalog reports a load error", async () => {
+    const host = await load(
       createHost({
-        models: [
-          { model: "big-model", efforts: ["high"], isDefault: true },
-          { model: "other-model", efforts: ["low"] },
-        ],
+        modelLoadError: { providerId: "codex", code: "timeout" },
+        models: [{ model: "gpt-5.4-mini", efforts: ["high"], defaultEffort: "high" }],
+        settings: { providerId: "codex", model: "gpt-5.4-mini", reasoningLevel: "medium" },
       }),
     );
-    await providerDefault.harness.behavior.callRpc("retitle", { threadId: THREAD_ID });
-    expect(providerDefault.spawns[0]).not.toHaveProperty("model");
-    expect(providerDefault.spawns[0]).not.toHaveProperty("reasoningLevel");
+    await host.harness.behavior.callRpc("retitle", { threadId: THREAD_ID });
+    expect(host.spawns[0]).toMatchObject({
+      providerId: "codex",
+      model: "gpt-5.4-mini",
+      reasoningLevel: "medium",
+    });
+    expect(
+      host.harness.inspection.logEntries.some(
+        (entry) => entry.level === "warn" && entry.message.includes("timeout"),
+      ),
+    ).toBe(true);
+  });
+
+  it("still picks a listed small model when the catalog reports a load error", async () => {
+    const host = await load(
+      createHost({
+        modelLoadError: { providerId: "claude-code", code: "failed" },
+        models: [{ model: "claude-haiku-4-5-20251001", efforts: ["high"], defaultEffort: "high" }],
+      }),
+    );
+    await host.harness.behavior.callRpc("retitle", { threadId: THREAD_ID });
+    expect(host.spawns[0]).toMatchObject({
+      model: "claude-haiku-4-5-20251001",
+      reasoningLevel: "low",
+    });
   });
 
   it("keeps the configured model and level when the catalog cannot be read", async () => {

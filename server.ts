@@ -148,10 +148,24 @@ export default async function plugin(bb: BbPluginApi) {
     }
     const available = new Set(catalog.models.flatMap((entry) => [entry.id, entry.model]));
     const model = configuredModel !== "" ? configuredModel : pickSmallModel(providerId, available);
-    const entry =
-      model !== undefined
-        ? catalog.models.find((candidate) => candidate.id === model || candidate.model === model)
-        : catalog.models.find((candidate) => candidate.isDefault);
+    // Check the level only against the model that will run. Without a model,
+    // bb chooses it (possibly a remembered project model, not the catalog
+    // default). After a failed catalog read the entries are fallback data.
+    if (catalog.modelLoadError !== null) {
+      bb.log.warn(
+        `could not load ${providerId} models (${catalog.modelLoadError.code}); keeping ${configuredReasoning} reasoning`,
+      );
+    }
+    if (model === undefined || catalog.modelLoadError !== null) {
+      return {
+        providerId,
+        ...(model !== undefined ? { model } : {}),
+        reasoningLevel: configuredReasoning,
+      };
+    }
+    const entry = catalog.models.find(
+      (candidate) => candidate.id === model || candidate.model === model,
+    );
     const reasoningLevel = pickReasoningLevel<PluginProviderReasoningLevel>(
       configuredReasoning,
       entry?.supportedReasoningEfforts?.map((effort) => effort.reasoningEffort),
@@ -159,7 +173,7 @@ export default async function plugin(bb: BbPluginApi) {
     );
     if (reasoningLevel !== configuredReasoning) {
       bb.log.info(
-        `${providerId}/${model ?? "(provider default)"} does not support ${configuredReasoning} reasoning; using ${reasoningLevel ?? "the bb default"}`,
+        `${providerId}/${model} does not support ${configuredReasoning} reasoning; using ${reasoningLevel ?? "the bb default"}`,
       );
     }
     return {
